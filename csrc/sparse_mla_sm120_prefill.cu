@@ -27,7 +27,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // Sparse-MLA SM120 prefill. Single raw-pointer entry point that dispatches:
-//   - DSV3_2 / DSV4 model split
+//   - DSV3_2 / DSV4 / GLM_NSA / GLM53_NOPE model split
 //   - swapAB (warp specialized, 64 heads/CTA) for the DSV3_2 family at
 //     num_heads 64 / 128
 //   - SG (single-group, 16 heads/CTA) for num_heads <= 16
