@@ -214,15 +214,15 @@ struct SmemPtrsMG {
 // swapAB (warp specialized) tiling and layout: candidates on the MMA M axis and
 // heads on N, so one warp owns HEADS_PER_WARP heads and Q stays in registers.
 
-template <ModelType MT>
+template <ModelType MT, int NUM_MATH_WARPS = N_MATH_WARPS>
 struct ComputeTraitsSwapAB {
   using KV = KVCacheTraits<MT>;
 
   static constexpr int HEADS_PER_WARP = 8;
-  static constexpr int HEADS_PER_CTA = N_MATH_WARPS * HEADS_PER_WARP;  // 64
-  static constexpr int MTILES = BI / 16;                               // 4
-  static constexpr int NOPE_KSTEPS = KV::D_NOPE / 32;                  // 16
-  static constexpr int STEPS_PER_GRP = KV::QUANT_TILE / 32;            // 4
+  static constexpr int HEADS_PER_CTA = NUM_MATH_WARPS * HEADS_PER_WARP;
+  static constexpr int MTILES = BI / 16;                     // 4
+  static constexpr int NOPE_KSTEPS = KV::D_NOPE / 32;        // 16
+  static constexpr int STEPS_PER_GRP = KV::QUANT_TILE / 32;  // 4
   // Candidate M-tiles per QK pass: two independent MMA chains, bounded A live set.
   static constexpr int MPASS = 2;
   static constexpr int MPASSES = MTILES / MPASS;  // 2
@@ -234,13 +234,15 @@ struct ComputeTraitsSwapAB {
   static constexpr int XV_KSTEPS = BI / 32;                        // 2
   static constexpr int P_PASSES = WeightFp8PassTraits<KV::SCALE_FORMAT>::PASSES;
 
+  static_assert(NUM_MATH_WARPS == 4 || NUM_MATH_WARPS == 8,
+                "swapAB supports one or two math warpgroups");
   static_assert(KV::QUANT_TILE % V_CHUNK == 0, "a dequant group must cover whole V chunks");
 };
 
-template <ModelType MT>
+template <ModelType MT, int NUM_MATH_WARPS = N_MATH_WARPS>
 struct SmemLayoutSwapAB {
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraitsSwapAB<MT>;
+  using CT = ComputeTraitsSwapAB<MT, NUM_MATH_WARPS>;
 
   static constexpr int KV_STRIDE = KV::KV_GMEM_STRIDE;          // 656
   static constexpr int P_TILE_BYTES = CT::HEADS_PER_WARP * BI;  // 512
@@ -257,7 +259,7 @@ struct SmemLayoutSwapAB {
   static constexpr size_t SMEM_SCRATCH_WARP = (size_t)CT::P_PASSES * P_TILE_BYTES > SMEM_O_WARP
                                                   ? (size_t)CT::P_PASSES* P_TILE_BYTES
                                                   : SMEM_O_WARP;
-  static constexpr size_t SMEM_SCRATCH = N_MATH_WARPS * SMEM_SCRATCH_WARP;
+  static constexpr size_t SMEM_SCRATCH = NUM_MATH_WARPS * SMEM_SCRATCH_WARP;
   static constexpr size_t SMEM_MBAR = 2 * sizeof(uint64_t);
 
   static constexpr size_t OFF_KV0 = 0;
@@ -270,9 +272,9 @@ struct SmemLayoutSwapAB {
   static_assert(TOTAL <= 101376, "swapAB smem exceeds 99KB per-block limit");
 };
 
-template <ModelType MT>
+template <ModelType MT, int NUM_MATH_WARPS = N_MATH_WARPS>
 struct SmemPtrsSwapAB {
-  using L = SmemLayoutSwapAB<MT>;
+  using L = SmemLayoutSwapAB<MT, NUM_MATH_WARPS>;
 
   uint8_t* kv_bufs[2];
   uint8_t* p_buf;  // this warp's stmatrix tile (P_PASSES × P_TILE_BYTES)

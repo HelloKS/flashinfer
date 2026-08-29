@@ -33,6 +33,7 @@ Sweeps representative shapes:
 * DSv4   (d_qk=512, page_block_size=64, 584 B/token)
 * DSv4 dual cache (fixed main cache + secondary cache)
 * DSv3.2 (d_qk=576, page_block_size=64, 656 B/token)
+* GLM53 NoPE (d_qk=512, 32 heads, topk=2176, 656 B/token)
 
 The KV pool is sized ≫ L2 so the analytical KV bandwidth reflects DRAM-bound
 large-cache prefill. Reports median latency, KV bandwidth, and analytical
@@ -129,6 +130,28 @@ def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
         )
     rope = kv[:, :, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
     result[:, :, d_nope + scale_bytes :] = rope.view(nb, bs, d_rope * 2)
+    return result.view(nb, bs, 1, bpt)
+
+
+def quantize_kv_glm53_nope(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Pack native NoPE KV into the 656B ABI with arbitrary FP32 scales."""
+    d_nope, tile_size, num_tiles = 512, 128, 4
+    bpt = 656
+    nb, bs, hk, d = kv_bf16.shape
+    assert d == d_nope and hk == 1
+    kv = kv_bf16.squeeze(2)
+
+    result = torch.zeros(nb, bs, bpt, dtype=torch.uint8, device=kv.device)
+    for ti in range(num_tiles):
+        tile = kv[..., ti * tile_size : (ti + 1) * tile_size].float()
+        scale = (tile.abs().amax(dim=-1).clamp(min=1e-4) / 448.0).to(torch.float32)
+        fp8 = (tile / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+        result[..., ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
+        result[..., d_nope + ti * 4 : d_nope + (ti + 1) * 4] = (
+            scale.contiguous().view(torch.uint8).view(nb, bs, 4)
+        )
+
+    # Bytes 528:656 remain reserved padding in the stable packed-cache ABI.
     return result.view(nb, bs, 1, bpt)
 
 
@@ -383,6 +406,72 @@ def bench_sparse_mla_sm120_dsv3_2(
     return ms * 1e3, kv_bw_gbps, tflops
 
 
+def bench_sparse_mla_sm120_glm53_nope(num_tokens, with_sink=False, seed=0):
+    """Benchmark the native 32-head GLM53 NoPE prefill specialization."""
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    num_heads, topk = 32, 2176
+    d_qk = d_v = 512
+    page_block_size = 64
+    num_blocks = 16384
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_glm53_nope(kv_bf16)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+    output = torch.zeros(
+        num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
+    )
+    runner = _SparseMLAPagedAttentionRunner(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        kv_scale_format="arbitrary_fp32",
+        device=device,
+    )
+
+    def fn():
+        runner.run(
+            q,
+            kv_packed,
+            indices,
+            output,
+            d_qk**-0.5,
+            attn_sink=attn_sink,
+        )
+
+    fn()
+    torch.cuda.synchronize()
+    measurements = bench_gpu_time(fn, dry_run_time_ms=100, repeat_time_ms=1000)
+    ms = float(np.median(measurements))
+
+    kv_bytes = num_tokens * topk * 656
+    kv_bw_gbps = kv_bytes * 1e-6 / ms
+    flops = 2 * num_tokens * num_heads * topk * (d_qk + d_v)
+    tflops = flops * 1e-9 / ms
+    return ms * 1e3, kv_bw_gbps, tflops
+
+
 if __name__ == "__main__":
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("Sparse-MLA SM120 requires sm120a.")
@@ -532,3 +621,14 @@ if __name__ == "__main__":
             print(
                 f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
             )
+
+    print()
+    print("GLM53 NoPE swapAB prefill path (heads=32, topk=2176):")
+    print(header)
+    print("-" * len(header))
+    for t in (65, 128, 256, 512, 1024):
+        lat_us, kvbw, tfl = bench_sparse_mla_sm120_glm53_nope(t)
+        print(
+            f"{32:>10}  {2176:>6}  {t:>11}  {lat_us:>10.1f}  "
+            f"{kvbw:>13.1f}  {tfl:>12.2f}"
+        )

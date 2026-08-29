@@ -99,22 +99,23 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// Warp-specialized swapAB dispatcher (DSV3_2 family, 64 heads/CTA, single cache).
-template <ModelType MT, int NUM_HEADS, int TOPK>
+// Warp-specialized swapAB dispatcher. RoPE-bearing V32 models use two math
+// warpgroups (64 heads/CTA); GLM53 NoPE uses one (32 heads/CTA).
+template <ModelType MT, int NUM_HEADS, int TOPK, int NUM_MATH_WARPS = N_MATH_WARPS>
 void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                            const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                            int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
                            cudaStream_t stream) {
-  using CT = ComputeTraitsSwapAB<MT>;
-  using L = SmemLayoutSwapAB<MT>;
+  using CT = ComputeTraitsSwapAB<MT, NUM_MATH_WARPS>;
+  using L = SmemLayoutSwapAB<MT, NUM_MATH_WARPS>;
   static_assert(KVCacheTraits<MT>::SCALE_IN_KV_SMEM && KVCacheTraits<MT>::D_NOPE == D_V,
-                "swapAB prefill is DSV3_2 family only: inline scales, V spans the nope half");
+                "swapAB requires inline scales and V to span the NoPE dimensions");
   constexpr size_t smem_bytes = L::TOTAL;
   constexpr int REPLICATE_H = NUM_HEADS / CT::HEADS_PER_CTA;
   dim3 grid(num_tokens * REPLICATE_H);
-  dim3 block(BLOCK_THREADS);
+  dim3 block((NUM_MATH_WARPS + N_IO_WARPS) * 32);
 
-  auto kernel = sparse_mla_prefill_swapab_kernel<MT, NUM_HEADS, TOPK>;
+  auto kernel = sparse_mla_prefill_swapab_kernel<MT, NUM_HEADS, TOPK, NUM_MATH_WARPS>;
   static bool configured[kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
@@ -246,29 +247,36 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// swapAB covers the head counts that fill whole 64-head CTAs; the rest fall
-// through to SG/MG below.
+// swapAB covers complete head tiles: 64 heads for the RoPE-bearing V32 family
+// and the native 32-head tile for GLM53 NoPE. Other shapes fall through.
 template <ModelType MT>
 inline bool dispatch_v32_swapab(int num_heads, const bf16* Q, const uint8_t* KV,
                                 const int32_t* indices, const float* attn_sink, bf16* output,
                                 float* out_lse, float sm_scale, int num_tokens,
                                 size_t stride_kv_block, const int* topk_length_ptr,
                                 cudaStream_t stream) {
-#define DISPATCH_DSV3_2_SWAPAB(NH)                                                          \
-  launch_prefill_swapab<MT, NH, 2048>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, \
-                                      num_tokens, stride_kv_block, topk_length_ptr, stream)
+  if constexpr (MT == ModelType::GLM53_NOPE) {
+    if (num_heads != 32) return false;
+    launch_prefill_swapab<MT, 32, 2176, 4>(Q, KV, indices, attn_sink, output, out_lse, sm_scale,
+                                           num_tokens, stride_kv_block, topk_length_ptr, stream);
+    return true;
+  } else {
+#define DISPATCH_DSV3_2_SWAPAB(NH)                                                             \
+  launch_prefill_swapab<MT, NH, 2048, 8>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, \
+                                         num_tokens, stride_kv_block, topk_length_ptr, stream)
 
-  switch (num_heads) {
-    case 64:
-      DISPATCH_DSV3_2_SWAPAB(64);
-      return true;
-    case 128:
-      DISPATCH_DSV3_2_SWAPAB(128);
-      return true;
-    default:
-      return false;
-  }
+    switch (num_heads) {
+      case 64:
+        DISPATCH_DSV3_2_SWAPAB(64);
+        return true;
+      case 128:
+        DISPATCH_DSV3_2_SWAPAB(128);
+        return true;
+      default:
+        return false;
+    }
 #undef DISPATCH_DSV3_2_SWAPAB
+  }
 }
 
 template <ModelType MT>
@@ -281,13 +289,9 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
   constexpr int TOPK = MT == ModelType::GLM53_NOPE ? 2176 : 2048;
   if (topk != TOPK) return false;
 
-  // PR #4751's swapAB path is specialized for the RoPE-bearing V32 family.
-  // Native NoPE uses the generalized SG/MG path added by PR #4791.
-  if constexpr (MT != ModelType::GLM53_NOPE) {
-    if (dispatch_v32_swapab<MT>(num_heads, Q, KV, indices, attn_sink, output, out_lse, sm_scale,
-                                num_tokens, stride_kv_block, topk_length_ptr, stream))
-      return true;
-  }
+  if (dispatch_v32_swapab<MT>(num_heads, Q, KV, indices, attn_sink, output, out_lse, sm_scale,
+                              num_tokens, stride_kv_block, topk_length_ptr, stream))
+    return true;
 
   // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=8 covers
   // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16

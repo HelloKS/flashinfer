@@ -1038,7 +1038,8 @@ def test_sparse_mla_sm120_decode_glm53_nope() -> None:
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_prefill_glm53_nope() -> None:
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_prefill_glm53_nope(with_sink: bool) -> None:
     torch.manual_seed(4)
     device = torch.device("cuda")
     d_qk = d_v = 512
@@ -1064,9 +1065,29 @@ def test_sparse_mla_sm120_prefill_glm53_nope() -> None:
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    indices[:, topk // 2 :] = -1
+    topk_lengths_to_test = torch.tensor(
+        [1, 63, 64, 65, topk - 1, topk], dtype=torch.int32, device=device
+    )
+    topk_length = topk_lengths_to_test.repeat(
+        (num_tokens + len(topk_lengths_to_test) - 1) // len(topk_lengths_to_test)
+    )[:num_tokens]
+    # Exercise invalid slots independently of the per-token ragged boundary.
+    indices[:, -17:] = -1
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
     sm_scale = d_qk**-0.5
-    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+    ref_out, ref_lse = _ref_sparse_attn(
+        q,
+        kv_dequant,
+        indices,
+        sm_scale,
+        d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
 
     output = torch.zeros(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
@@ -1082,6 +1103,8 @@ def test_sparse_mla_sm120_prefill_glm53_nope() -> None:
         sm_scale,
         d_v=d_v,
         kv_scale_format="arbitrary_fp32",
+        topk_length=topk_length,
+        attn_sink=attn_sink,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)

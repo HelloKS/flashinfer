@@ -1694,14 +1694,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_dual_f
 //   - Candidates on M, heads on N, so one warp owns HEADS_PER_WARP heads and
 //     softmax reduces inside the warp
 //   - Q is register resident, so the KV ring gets the whole smem budget
-//   - 8 math warps gather-fed by 4 IO warps
-//   - A CTA covers HEADS_PER_CTA = 64 heads of one query token, so NUM_HEADS
-//     128 launches two CTAs per token
+//   - One or two math warpgroups gather-fed by one 4-warp IO warpgroup
+//   - A CTA covers 32 heads with 4 math warps or 64 heads with 8 math warps
 //
 // Template params (all constexpr):
-//   MT:        ModelType (DSV3_2 / GLM_NSA)
-//   NUM_HEADS: 64, 128
-//   TOPK:      2048
+//   MT:             ModelType (DSV3_2 / GLM_NSA / GLM53_NOPE)
+//   NUM_HEADS:      32, 64, 128
+//   TOPK:           2048 or 2176
+//   NUM_MATH_WARPS: 4 or 8
 // ============================================================================
 
 // Unlike io_bulk_gather_tile this copies the whole gmem row, rope included, so
@@ -1723,8 +1723,8 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, const i
   }
 }
 
-template <ModelType MT, int NUM_HEADS, int TOPK>
-__global__ void __launch_bounds__(BLOCK_THREADS, 1)
+template <ModelType MT, int NUM_HEADS, int TOPK, int NUM_MATH_WARPS = N_MATH_WARPS>
+__global__ void __launch_bounds__((NUM_MATH_WARPS + N_IO_WARPS) * 32, 1)
     sparse_mla_prefill_swapab_kernel(const bf16* __restrict__ Q,
                                      const uint8_t* __restrict__ KV_cache,
                                      const int32_t* __restrict__ indices,
@@ -1732,12 +1732,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                      bf16* __restrict__ output, float* __restrict__ out_lse,
                                      __grid_constant__ const PrefillColdParams cold) {
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraitsSwapAB<MT>;
-  using L = SmemLayoutSwapAB<MT>;
+  using CT = ComputeTraitsSwapAB<MT, NUM_MATH_WARPS>;
+  using L = SmemLayoutSwapAB<MT, NUM_MATH_WARPS>;
 
   static constexpr int REPLICATE_H = NUM_HEADS / CT::HEADS_PER_CTA;
   static constexpr int HPW = CT::HEADS_PER_WARP;
   static constexpr bool SOFT_SCALE = (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32);
+  static constexpr int SWAPAB_BLOCK_THREADS = (NUM_MATH_WARPS + N_IO_WARPS) * 32;
+  static constexpr int SWAPAB_MATH_THREADS = NUM_MATH_WARPS * 32;
+  static_assert(NUM_HEADS % CT::HEADS_PER_CTA == 0, "NUM_HEADS must fill every swapAB head tile");
 
   const int s_i = blockIdx.x / REPLICATE_H;
   const int h_start = (blockIdx.x % REPLICATE_H) * CT::HEADS_PER_CTA;
@@ -1752,22 +1755,23 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
   extern __shared__ char smem_raw[];
-  auto sm = SmemPtrsSwapAB<MT>::init(smem_raw, warp_rank < N_MATH_WARPS ? warp_rank : 0);
+  auto sm = SmemPtrsSwapAB<MT, NUM_MATH_WARPS>::init(smem_raw,
+                                                     warp_rank < NUM_MATH_WARPS ? warp_rank : 0);
 
   if (threadIdx.x == 0) {
 #pragma unroll
     for (int s = 0; s < 2; s++) {
-      mbarrier_init(sm.mbar_kv + s, 1);             // the bulk gather signals once per tile
-      mbarrier_init(sm.mbar_wr + s, N_MATH_WARPS);  // one release per math warp
+      mbarrier_init(sm.mbar_kv + s, 1);               // the bulk gather signals once per tile
+      mbarrier_init(sm.mbar_wr + s, NUM_MATH_WARPS);  // one release per math warp
     }
   }
-  bar_sync_t<3, BLOCK_THREADS>();
+  bar_sync_t<3, SWAPAB_BLOCK_THREADS>();
 
   // ── IO warps ────────────────────────────────────────────────────
-  if (warp_rank >= N_MATH_WARPS) {
+  if (warp_rank >= NUM_MATH_WARPS) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(24));
 
-    const int io_tid = threadIdx.x - MATH_THREADS;
+    const int io_tid = threadIdx.x - SWAPAB_MATH_THREADS;
     const uint64_t kv_l2_policy = create_l2_evict_last_policy();
 
     int wr_phase = 1;
@@ -1793,7 +1797,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     const bf16* q_base = Q + ((size_t)s_i * NUM_HEADS + h_base + gid) * KV::D_QK;
 
     QSwapABRegs<MT> q = quantize_q_to_regs_swapab<MT>(q_base, lane);
-    KVRopePrefetch<MT> q_rope = prefetch_kv_rope<MT>(q_base + KV::D_NOPE, lane);
+    KVRopePrefetch<MT> q_rope{};
+    if constexpr (KV::D_ROPE > 0) q_rope = prefetch_kv_rope<MT>(q_base + KV::D_NOPE, lane);
 
     uint8_t sfb[KV::NUM_SCALES];
     float q_sc[2][KV::NUM_SCALES];
@@ -1919,13 +1924,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       }
 
       // ── QK rope: stored raw, so it lands in the real domain ──
+      if constexpr (KV::D_ROPE > 0) {
 #pragma unroll
-      for (int m = 0; m < CT::MTILES; m++)
-        compute_qk_rope_swapab<MT, L::KV_STRIDE>(
-            qk[m],
-            reinterpret_cast<const bf16*>(kv_smem + (size_t)(m * 16) * L::KV_STRIDE +
-                                          KV::KV_ROPE_GMEM_OFFSET),
-            q_rope, lane);
+        for (int m = 0; m < CT::MTILES; m++)
+          compute_qk_rope_swapab<MT, L::KV_STRIDE>(
+              qk[m],
+              reinterpret_cast<const bf16*>(kv_smem + (size_t)(m * 16) * L::KV_STRIDE +
+                                            KV::KV_ROPE_GMEM_OFFSET),
+              q_rope, lane);
+      }
 
       // ── Masking + online softmax (warp-local) ───────────────
       float s[CT::MTILES][4];
